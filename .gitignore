@@ -1,3 +1,6 @@
 ﻿__pycache__/
 *.pyc
 
+data/daily/*.csv
+data/consolidado_historico.csv
+data/estado_chaves_dedup.txt
