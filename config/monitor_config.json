@@ -2,12 +2,13 @@
   "keywords": [
     "cal virgem",
     "cal hidratada",
+    "calcario",
+    "calcario agricola",
     "calcario calcitico",
     "calcario dolomitico",
-    "corretivo de solo",
-    "calcario agricola"
+    "corretivo de solo"
   ],
-  "window_days": 30,
+  "window_days": 14,
   "destinations": {
     "emails": [
       "compras@empresa.com"
@@ -23,12 +24,17 @@
     "pncp": {
       "enabled": true,
       "base_url": "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao",
-      "page_size": 50,
-      "max_pages": 5,
+      "page_size": 10,
+      "max_pages": 3,
       "codigo_modalidade_contratacao": [
         10
       ],
-      "timeout_seconds": 30
+      "only_open": true,
+      "query_chunk_days": 3,
+      "request_retries": 2,
+      "max_consecutive_failures": 2,
+      "fail_on_unavailable": false,
+      "timeout_seconds": 20
     },
     "compras_gov_br": {
       "enabled": false

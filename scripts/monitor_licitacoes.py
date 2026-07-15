@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+import unicodedata
 from urllib import error, parse, request
 
 
@@ -34,6 +35,7 @@ class Licitacao:
     fonte: str
     data_captura: str
     unique_source_id: str
+    status: str = ""
 
     def as_csv_row(self) -> Dict[str, str]:
         return {
@@ -67,9 +69,14 @@ class PncpIngestor(SourceIngestor):
 
         page_size = int(self.source_config.get("page_size", 50))
         max_pages = int(self.source_config.get("max_pages", 5))
-        modalidade_codes_raw = self.source_config.get("codigo_modalidade_contratacao", [10])
+        modalidade_codes_raw = self.source_config.get("codigo_modalidade_contratacao", [10, 11, 12, 13, 14])
         timeout_seconds = int(self.source_config.get("timeout_seconds", 30))
         window_days = int(self.source_config.get("window_days", 30))
+        query_chunk_days = int(self.source_config.get("query_chunk_days", 7))
+        request_retries = int(self.source_config.get("request_retries", 2))
+        max_consecutive_failures = int(self.source_config.get("max_consecutive_failures", 2))
+        only_open = bool(self.source_config.get("only_open", True))
+        fail_on_unavailable = bool(self.source_config.get("fail_on_unavailable", False))
 
         if page_size < 10 or max_pages <= 0:
             raise ValueError(
@@ -79,46 +86,78 @@ class PncpIngestor(SourceIngestor):
             raise ValueError(
                 "Configuracao PNCP invalida: 'codigo_modalidade_contratacao' deve ser uma lista nao vazia."
             )
+        if query_chunk_days < 1:
+            raise ValueError("Configuracao PNCP invalida: 'query_chunk_days' deve ser maior que zero.")
+        if request_retries < 1:
+            raise ValueError("Configuracao PNCP invalida: 'request_retries' deve ser maior que zero.")
+        if max_consecutive_failures < 1:
+            raise ValueError("Configuracao PNCP invalida: 'max_consecutive_failures' deve ser maior que zero.")
 
         capture = datetime.strptime(self.capture_date, "%Y-%m-%d").date()
-        data_inicial = (capture - timedelta(days=window_days)).strftime("%Y%m%d")
-        data_final = capture.strftime("%Y%m%d")
+        date_ranges = self._build_date_ranges(capture, window_days, query_chunk_days)
         modalidade_codes = [int(x) for x in modalidade_codes_raw]
 
         licitacoes: List[Licitacao] = []
+        request_errors: List[str] = []
+        successful_requests = 0
+        consecutive_failures = 0
         for modalidade_code in modalidade_codes:
-            for page in range(1, max_pages + 1):
-                query = parse.urlencode(
-                    {
-                        "dataInicial": data_inicial,
-                        "dataFinal": data_final,
-                        "codigoModalidadeContratacao": modalidade_code,
-                        "pagina": page,
-                        "tamanhoPagina": page_size,
-                    }
-                )
-                url = f"{base_url}?{query}"
-                payload = self._get_json(url, timeout_seconds)
-                items = self._extract_items(payload)
-
-                if page == 1 and not items:
-                    raise RuntimeError(
-                        "A resposta da API do PNCP nao trouxe itens no formato esperado. "
-                        "Verifique endpoint e parametros obrigatorios."
+            for range_start, range_end in date_ranges:
+                data_inicial = range_start.strftime("%Y%m%d")
+                data_final = range_end.strftime("%Y%m%d")
+                for page in range(1, max_pages + 1):
+                    query = parse.urlencode(
+                        {
+                            "dataInicial": data_inicial,
+                            "dataFinal": data_final,
+                            "codigoModalidadeContratacao": modalidade_code,
+                            "pagina": page,
+                            "tamanhoPagina": page_size,
+                        }
                     )
-                if not items:
-                    break
+                    url = f"{base_url}?{query}"
+                    try:
+                        payload = self._get_json(url, timeout_seconds, request_retries)
+                    except RuntimeError as exc:
+                        request_errors.append(str(exc))
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            break
+                        break
+                    consecutive_failures = 0
+                    successful_requests += 1
+                    items = self._extract_items(payload)
 
-                for item in items:
-                    licitacao = self._normalize_item(item)
-                    if licitacao is not None:
-                        licitacoes.append(licitacao)
+                    if not items:
+                        break
+
+                    for item in items:
+                        licitacao = self._normalize_item(item)
+                        if licitacao is not None:
+                            if only_open and not self._is_open_status(licitacao.status):
+                                continue
+                            licitacoes.append(licitacao)
+                if consecutive_failures >= max_consecutive_failures:
+                    break
+            if consecutive_failures >= max_consecutive_failures:
+                break
+
+        if successful_requests == 0:
+            details = "; ".join(request_errors[:3])
+            message = (
+                "Falha ao consultar PNCP em todas as tentativas."
+                + (f" Detalhes: {details}" if details else "")
+            )
+            if fail_on_unavailable:
+                raise RuntimeError(message)
+            print(f"AVISO: {message}")
+            return []
 
         return licitacoes
 
-    def _get_json(self, url: str, timeout_seconds: int) -> Any:
+    def _get_json(self, url: str, timeout_seconds: int, request_retries: int) -> Any:
         req = request.Request(url=url, headers={"Accept": "application/json", "User-Agent": "licitacao-monitor/1.0"})
-        attempts = 3
+        attempts = request_retries
         last_exception: Optional[Exception] = None
         raw = b""
         for attempt in range(1, attempts + 1):
@@ -180,6 +219,7 @@ class PncpIngestor(SourceIngestor):
             self._str_first(item, "dataAberturaProposta", "dataAbertura", "dataInicioRecebimentoPropostas")
         )
         link_edital = self._str_first(item, "linkSistemaOrigem", "link", "url", "linkEdital")
+        status = self._str_first(item, "situacaoCompraNome", "situacao", "status", "situacaoCompra")
 
         source_id = self._str_first(item, "numeroControlePNCP", "id", "idContratacao", "sequencialCompra")
         if source_id:
@@ -198,7 +238,18 @@ class PncpIngestor(SourceIngestor):
             fonte=self.name,
             data_captura=self.capture_date,
             unique_source_id=unique_source_id,
+            status=status,
         )
+
+    def _is_open_status(self, status: str) -> bool:
+        normalized = normalize_text(status)
+        if not normalized:
+            return True
+        closed_tokens = ("encerrad", "homologad", "revogad", "cancelad", "suspens")
+        if any(token in normalized for token in closed_tokens):
+            return False
+        open_tokens = ("abert", "receb", "divulgad", "andamento", "publicad", "proposta")
+        return any(token in normalized for token in open_tokens)
 
     def _str_first(self, item: Dict[str, Any], *keys: str) -> str:
         for key in keys:
@@ -230,6 +281,16 @@ class PncpIngestor(SourceIngestor):
         if "T" in raw:
             return raw.split("T", 1)[0]
         return raw
+
+    def _build_date_ranges(self, capture: date, window_days: int, chunk_days: int) -> List[tuple[date, date]]:
+        start = capture - timedelta(days=window_days)
+        ranges: List[tuple[date, date]] = []
+        current = start
+        while current <= capture:
+            range_end = min(current + timedelta(days=chunk_days - 1), capture)
+            ranges.append((current, range_end))
+            current = range_end + timedelta(days=1)
+        return ranges
 
 
 class NotImplementedIngestor(SourceIngestor):
@@ -333,8 +394,14 @@ def build_sources(config: Dict[str, Any], capture_date: str) -> List[SourceInges
 
 
 def contains_keyword(objeto: str, keywords: List[str]) -> bool:
-    lowered = objeto.lower()
-    return any(keyword.lower() in lowered for keyword in keywords)
+    normalized_objeto = normalize_text(objeto)
+    return any(normalize_text(keyword) in normalized_objeto for keyword in keywords)
+
+
+def normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return ascii_text.lower().strip()
 
 
 def is_within_window(data_abertura: str, capture_date: str, window_days: int) -> bool:
@@ -374,17 +441,27 @@ def deduplicate(records: List[Licitacao], known_keys: set[str]) -> List[Licitaca
 
 def write_csv(path: Path, rows: List[Dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        with path.open("w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writeheader()
+            writer.writerows(rows)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Sem permissao para gravar o arquivo diario '{path}'. Feche o arquivo no Excel e tente novamente."
+        ) from exc
 
 
 def append_csv(path: Path, rows: List[Dict[str, str]]) -> None:
     ensure_csv_with_header(path)
-    with path.open("a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=COLUMNS)
-        writer.writerows(rows)
+    try:
+        with path.open("a", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS)
+            writer.writerows(rows)
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Sem permissao para atualizar o historico '{path}'. Feche o arquivo no Excel e tente novamente."
+        ) from exc
 
 
 def main() -> int:
